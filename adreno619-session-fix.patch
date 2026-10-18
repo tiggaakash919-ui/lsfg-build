@@ -1,0 +1,293 @@
+diff -ruN pa/app/src/main/cpp/android_vk_session.cpp pb/app/src/main/cpp/android_vk_session.cpp
+--- a/app/src/main/cpp/android_vk_session.cpp	2026-10-18 05:23:54.085151814 +0000
++++ b/app/src/main/cpp/android_vk_session.cpp	2026-10-18 05:23:54.095114246 +0000
+@@ -6,6 +6,7 @@
+ #include <android/log.h>
+ 
+ #include <cstring>
++#include <string>
+ #include <vector>
+ 
+ #include "crash_reporter.hpp"
+@@ -55,6 +56,21 @@
+     VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
+ };
+ 
++const char *vk_result_name(VkResult r) {
++    switch (r) {
++        case VK_SUCCESS: return "VK_SUCCESS";
++        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
++        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
++        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
++        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
++        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
++        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
++        case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
++        case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
++        default: return "other VkResult";
++    }
++}
++
+ bool has_extension(const std::vector<VkExtensionProperties> &avail, const char *name) {
+     for (const auto &e : avail) {
+         if (std::strcmp(e.extensionName, name) == 0) return true;
+@@ -278,82 +294,147 @@
+              (int)hasSurfaceExts, (int)hasSwapchainDevExt);
+     }
+ 
+-    // Determine which features are in core vs. need explicit extensions.
+-    // Use extension-specific feature structs (their sType values are aliased to
+-    // the promoted core structs on 1.2/1.3) so this works on all API versions.
++    // ------------------------------------------------------------------
++    // Feature negotiation.
++    //
++    // A feature may only be enabled in VkDeviceCreateInfo if (a) the physical
++    // device reports it as supported via vkGetPhysicalDeviceFeatures2 and
++    // (b) for non-core features, the owning extension is enabled. Requesting
++    // an unsupported feature makes vkCreateDevice fail with
++    // VK_ERROR_FEATURE_NOT_PRESENT. Every feature below is therefore queried
++    // first and only requested when the query says VK_TRUE.
++    // ------------------------------------------------------------------
+     const bool api12 = props.apiVersion >= VK_API_VERSION_1_2;
+     const bool api13 = props.apiVersion >= VK_API_VERSION_1_3;
+ 
+-    // Timeline semaphores: core in 1.2, extension on 1.1
+-    if (!api12) {
+-        if (has_extension(avail, "VK_KHR_timeline_semaphore")) {
+-            enabledExts.push_back("VK_KHR_timeline_semaphore");
+-        } else {
+-            LOGW("VK_KHR_timeline_semaphore absent — framegen will be disabled");
+-        }
+-    }
++    // A feature struct is usable in a query/create chain when the feature is
++    // core at this API version, or the extension that defines it is exposed.
++    const bool canChainTimeline = api12 || has_extension(avail, "VK_KHR_timeline_semaphore");
++    const bool canChainSync2    = api13 || has_extension(avail, "VK_KHR_synchronization2");
++    const bool canChainMemModel = api12 || has_extension(avail, "VK_KHR_vulkan_memory_model");
++    const bool canChainRob2     = out.hasRobustness2;  // set above: extension present
+ 
+-    // synchronization2 (vkCmdPipelineBarrier2): core in 1.3, extension on 1.1/1.2.
+-    // If absent, framegen's compat_pipeline_barrier2 shim handles it transparently.
+-    const bool hasSync2Ext = has_extension(avail, "VK_KHR_synchronization2");
+-    if (!api13) {
+-        if (hasSync2Ext) {
+-            enabledExts.push_back("VK_KHR_synchronization2");
+-        } else {
+-            LOGW("VK_KHR_synchronization2 absent — framegen will use barrier compat shim");
+-        }
++    VkPhysicalDeviceSamplerYcbcrConversionFeatures qYcbcr{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
++    };
++    VkPhysicalDeviceTimelineSemaphoreFeaturesKHR qTimeline{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR,
++    };
++    VkPhysicalDeviceSynchronization2FeaturesKHR qSync2{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
++    };
++    VkPhysicalDeviceVulkanMemoryModelFeaturesKHR qMemModel{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR,
++    };
++    VkPhysicalDeviceRobustness2FeaturesEXT qRob2{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
++    };
++    {
++        void *head = &qYcbcr;
++        auto link = [&head](auto &st, bool ok) {
++            if (!ok) return;
++            st.pNext = head;
++            head = &st;
++        };
++        link(qTimeline, canChainTimeline);
++        link(qSync2, canChainSync2);
++        link(qMemModel, canChainMemModel);
++        link(qRob2, canChainRob2);
++        VkPhysicalDeviceFeatures2 f2{
++            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
++            .pNext = head,
++        };
++        vkGetPhysicalDeviceFeatures2(out.physicalDevice, &f2);
+     }
+ 
+-    // vulkanMemoryModel: core in 1.2 but optional even there; needs extension on 1.1
+-    if (!api12 && has_extension(avail, "VK_KHR_vulkan_memory_model"))
+-        enabledExts.push_back("VK_KHR_vulkan_memory_model");
+-
++    const bool supYcbcr    = qYcbcr.samplerYcbcrConversion == VK_TRUE;
++    const bool supTimeline = canChainTimeline && qTimeline.timelineSemaphore == VK_TRUE;
++    const bool supSync2    = canChainSync2 && qSync2.synchronization2 == VK_TRUE;
++    const bool supMemModel = canChainMemModel && qMemModel.vulkanMemoryModel == VK_TRUE;
++    const bool supNullDesc = canChainRob2 && qRob2.nullDescriptor == VK_TRUE;
++
++    LOGI("Feature query: samplerYcbcrConversion=%d timelineSemaphore=%d (chainable=%d) "
++         "synchronization2=%d (chainable=%d) vulkanMemoryModel=%d (chainable=%d) "
++         "robustness2.nullDescriptor=%d (chainable=%d)",
++         (int)supYcbcr, (int)supTimeline, (int)canChainTimeline,
++         (int)supSync2, (int)canChainSync2, (int)supMemModel, (int)canChainMemModel,
++         (int)supNullDesc, (int)canChainRob2);
++
++    // samplerYcbcrConversion is mandatory for the AHardwareBuffer import path.
++    if (!supYcbcr) {
++        LOGE("Mandatory feature samplerYcbcrConversion is not supported by this GPU");
++        return kSessionMissingFeature;
++    }
++
++    // Extensions that carry optional features. Only enable the extension when
++    // the corresponding feature is actually reported as supported.
++    if (!api12 && supTimeline)  enabledExts.push_back("VK_KHR_timeline_semaphore");
++    if (!api13 && supSync2)     enabledExts.push_back("VK_KHR_synchronization2");
++    if (!api12 && supMemModel)  enabledExts.push_back("VK_KHR_vulkan_memory_model");
++
++    if (!supTimeline) {
++        LOGW("timelineSemaphore not supported (API %u.%u, ext=%d): session device is created "
++             "without it. Framegen needs it and will be unavailable; capture/mirror still works.",
++             VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion),
++             (int)has_extension(avail, "VK_KHR_timeline_semaphore"));
++    }
++    if (!supSync2) {
++        LOGW("synchronization2 not supported — framegen will use barrier compat shim");
++    }
++    // The extension may be exposed while the feature bit is off; only report
++    // robustness2 as usable when nullDescriptor is really available.
++    if (out.hasRobustness2 && !supNullDesc) {
++        LOGW("VK_EXT_robustness2 present but nullDescriptor unsupported — treating as absent");
++        out.hasRobustness2 = false;
++    }
+     if (!out.hasRobustness2) {
+-        // Mali (most revisions), older Adreno, and PowerVR don't expose
+-        // VK_EXT_robustness2. Framegen handles this by binding a tiny 1x1
+-        // fallback descriptor image instead of relying on the nullDescriptor
+-        // feature — visually identical, ~zero perf cost. This is informational,
+-        // not an error.
+-        LOGI("VK_EXT_robustness2 absent — using 1x1 fallback descriptor image (no functional impact)");
++        // Framegen binds a tiny 1x1 fallback descriptor image instead of relying
++        // on nullDescriptor. Informational, not an error.
++        LOGI("robustness2.nullDescriptor unavailable — using 1x1 fallback descriptor image");
+     }
++    out.hasTimelineSemaphore = supTimeline;
++    out.hasSynchronization2  = supSync2;
+ 
+-    // Query optional feature support before requesting them in vkCreateDevice.
+-    VkPhysicalDeviceVulkanMemoryModelFeaturesKHR memModelQuery{
+-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR,
+-    };
+-    VkPhysicalDeviceFeatures2 features2Query{
+-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+-        .pNext = &memModelQuery,
+-    };
+-    vkGetPhysicalDeviceFeatures2(out.physicalDevice, &features2Query);
+-    const bool hasMemModel = memModelQuery.vulkanMemoryModel;
+-
+-    // Feature chain using extension-specific structs (compatible with all API versions).
++    // Build the create-info feature chain from supported features only.
+     VkPhysicalDeviceRobustness2FeaturesEXT robustness2{
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+         .nullDescriptor = VK_TRUE,
+     };
+     VkPhysicalDeviceVulkanMemoryModelFeaturesKHR memModel{
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR,
+-        .pNext = out.hasRobustness2 ? &robustness2 : nullptr,
+-        .vulkanMemoryModel = hasMemModel ? VK_TRUE : VK_FALSE,
++        .vulkanMemoryModel = VK_TRUE,
+     };
+-    const bool enableSync2 = api13 || hasSync2Ext;
+     VkPhysicalDeviceSynchronization2FeaturesKHR sync2{
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+-        .pNext = &memModel,
+         .synchronization2 = VK_TRUE,
+     };
+     VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineSem{
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR,
+-        .pNext = enableSync2 ? static_cast<void*>(&sync2) : static_cast<void*>(&memModel),
+         .timelineSemaphore = VK_TRUE,
+     };
+     VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+-        .pNext = &timelineSem,
+         .samplerYcbcrConversion = VK_TRUE,
+     };
++    void *chainHead = &ycbcr;
++    auto push = [&chainHead](auto &st, bool use) {
++        if (!use) return;
++        st.pNext = chainHead;
++        chainHead = &st;
++    };
++    push(timelineSem, supTimeline);
++    push(sync2, supSync2);
++    push(memModel, supMemModel);
++    push(robustness2, out.hasRobustness2);
++
++    {
++        std::string extList;
++        for (const char *e : enabledExts) { extList += e; extList += ' '; }
++        LOGI("vkCreateDevice: family=%u queues=1 enabledExts(%zu)=[ %s] features: ycbcr=1 timeline=%d "
++             "sync2=%d memModel=%d robustness2.nullDescriptor=%d",
++             out.computeFamilyIdx, enabledExts.size(), extList.c_str(),
++             (int)supTimeline, (int)supSync2, (int)supMemModel, (int)out.hasRobustness2);
++    }
+ 
+     const float prio = 1.0f;
+     const VkDeviceQueueCreateInfo qInfo{
+@@ -364,18 +445,19 @@
+     };
+     const VkDeviceCreateInfo devInfo{
+         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+-        .pNext = &ycbcr,
++        .pNext = chainHead,
+         .queueCreateInfoCount = 1,
+         .pQueueCreateInfos = &qInfo,
+         .enabledExtensionCount = static_cast<uint32_t>(enabledExts.size()),
+         .ppEnabledExtensionNames = enabledExts.data(),
+     };
+-    if (vkCreateDevice(out.physicalDevice, &devInfo, nullptr, &out.device) != VK_SUCCESS) {
+-        LOGE("vkCreateDevice failed");
++    const VkResult devRes = vkCreateDevice(out.physicalDevice, &devInfo, nullptr, &out.device);
++    if (devRes != VK_SUCCESS) {
++        out.lastVkResult = static_cast<int>(devRes);
++        LOGE("vkCreateDevice failed: VkResult=%d (%s)", (int)devRes, vk_result_name(devRes));
++        out.device = VK_NULL_HANDLE;
+         return kSessionDeviceCreateFailed;
+     }
+-    // Populate per-device table — these pointers stay valid for our device
+-    // even after framegen's volkLoadDevice() clobbers the globals.
+     volkLoadDeviceTable(&out.fn, out.device);
+ 
+     out.fn.vkGetDeviceQueue(out.device, out.computeFamilyIdx, 0, &out.computeQueue);
+diff -ruN pa/app/src/main/cpp/android_vk_session.hpp pb/app/src/main/cpp/android_vk_session.hpp
+--- a/app/src/main/cpp/android_vk_session.hpp	2026-10-18 05:23:54.085218525 +0000
++++ b/app/src/main/cpp/android_vk_session.hpp	2026-10-18 05:23:54.095149169 +0000
+@@ -24,6 +24,7 @@
+ constexpr int kSessionMissingExtension = -22;
+ constexpr int kSessionDeviceCreateFailed = -23;
+ constexpr int kSessionAlreadyInitialized = -24;
++constexpr int kSessionMissingFeature = -25;  // mandatory Vulkan feature unsupported
+ 
+ // Size of the pre-allocated command-buffer / fence ring. The worker thread
+ // rarely has more than 2-3 submissions in flight (input copy, post-process,
+@@ -81,6 +82,14 @@
+     // must surface a clear error to the user.
+     bool hasRobustness2 = false;
+ 
++    // Whether timelineSemaphore / synchronization2 were reported supported and
++    // enabled on OUR session device (framegen creates its own device).
++    bool hasTimelineSemaphore = false;
++    bool hasSynchronization2 = false;
++
++    // Raw VkResult of the last failed vkCreateDevice (0 if none).
++    int lastVkResult = 0;
++
+     // Whether VK_EXT_queue_family_foreign is enabled. If true, AHB ownership
+     // transitions use FOREIGN_EXT; otherwise EXTERNAL.
+     bool hasQueueFamilyForeign = false;
+diff -ruN pa/app/src/main/cpp/lsfg_render_loop.cpp pb/app/src/main/cpp/lsfg_render_loop.cpp
+--- a/app/src/main/cpp/lsfg_render_loop.cpp	2026-10-18 05:23:54.085993185 +0000
++++ b/app/src/main/cpp/lsfg_render_loop.cpp	2026-10-18 05:23:54.095423907 +0000
+@@ -2354,7 +2354,8 @@
+ 
+     int rc = create_session(g.vk);
+     if (rc != kOk) {
+-        LOGE("create_session failed rc=%d", rc);
++        LOGE("create_session failed rc=%d (lastVkResult=%d, hasTimelineSemaphore=%d)",
++             rc, g.vk.lastVkResult, (int)g.vk.hasTimelineSemaphore);
+         destroy_session(g.vk);
+         return kRenderLoopSessionFailed;
+     }
