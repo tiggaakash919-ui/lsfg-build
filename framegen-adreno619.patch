@@ -1,0 +1,422 @@
+diff -ruN fg_orig/framegen/include/common/utils.hpp fg/lsfg-vk-android-release/framegen/include/common/utils.hpp
+--- a/framegen/include/common/utils.hpp	2026-10-18 06:11:51.958343577 +0000
++++ b/framegen/include/common/utils.hpp	2026-10-18 06:12:29.828613749 +0000
+@@ -20,6 +20,15 @@
+ namespace LSFG::Utils {
+ 
+     ///
++    /// Record image memory barriers. Uses vkCmdPipelineBarrier2 when the
++    /// device enabled synchronization2, otherwise translates the barriers to
++    /// the equivalent legacy vkCmdPipelineBarrier call (same stages, access
++    /// masks, layouts and queue-family ownership transfer).
++    ///
++    void cmdImageBarriers(VkCommandBuffer cmd,
++        const std::vector<VkImageMemoryBarrier2>& barriers);
++
++    ///
+     /// Insert memory barriers for images in a command buffer.
+     ///
+     /// @throws std::logic_error if the command buffer is not in Recording state
+diff -ruN fg_orig/framegen/include/core/device.hpp fg/lsfg-vk-android-release/framegen/include/core/device.hpp
+--- a/framegen/include/core/device.hpp	2026-10-18 06:11:51.958549634 +0000
++++ b/framegen/include/core/device.hpp	2026-10-18 06:12:29.826987681 +0000
+@@ -11,6 +11,11 @@
+ 
+     class Image;
+ 
++    /// Process-wide: whether the most recently created Device enabled
++    /// synchronization2. When false, callers must use the legacy
++    /// vkCmdPipelineBarrier path (see Utils::cmdImageBarriers).
++    [[nodiscard]] bool isSynchronization2Enabled() noexcept;
++
+     ///
+     /// C++ wrapper class for a Vulkan device.
+     ///
+@@ -38,6 +43,10 @@
+         [[nodiscard]] VkQueue getComputeQueue() const { return this->computeQueue; }
+         /// Whether the device supports null image descriptors.
+         [[nodiscard]] bool supportsNullDescriptor() const { return this->nullDescriptorSupported; }
++        /// Whether the timelineSemaphore feature was enabled on this device.
++        [[nodiscard]] bool supportsTimelineSemaphore() const { return this->timelineSupported; }
++        /// Whether the synchronization2 feature was enabled on this device.
++        [[nodiscard]] bool supportsSynchronization2() const { return this->sync2Supported; }
+         /// Valid sampled image used for optional bindings when nullDescriptor is absent.
+         [[nodiscard]] const Image& getFallbackDescriptorImage() const;
+ 
+@@ -55,6 +64,8 @@
+ 
+         VkQueue computeQueue{};
+         bool nullDescriptorSupported{false};
++        bool timelineSupported{false};
++        bool sync2Supported{false};
+         std::shared_ptr<Image> fallbackDescriptorImage;
+     };
+ 
+diff -ruN fg_orig/framegen/src/common/utils.cpp fg/lsfg-vk-android-release/framegen/src/common/utils.cpp
+--- a/framegen/src/common/utils.cpp	2026-10-18 06:11:51.958879502 +0000
++++ b/framegen/src/common/utils.cpp	2026-10-18 06:12:49.822136358 +0000
+@@ -21,6 +21,62 @@
+ using namespace LSFG;
+ using namespace LSFG::Utils;
+ 
++// The legacy and synchronization2 stage/access bit values are identical for the
++// bits used by this library, so truncating the 64-bit masks is lossless here.
++static_assert(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
++static_assert(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++static_assert(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT == VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++static_assert(VK_PIPELINE_STAGE_2_TRANSFER_BIT == VK_PIPELINE_STAGE_TRANSFER_BIT);
++static_assert(VK_ACCESS_2_SHADER_READ_BIT == VK_ACCESS_SHADER_READ_BIT);
++static_assert(VK_ACCESS_2_SHADER_WRITE_BIT == VK_ACCESS_SHADER_WRITE_BIT);
++static_assert(VK_ACCESS_2_TRANSFER_WRITE_BIT == VK_ACCESS_TRANSFER_WRITE_BIT);
++
++void Utils::cmdImageBarriers(VkCommandBuffer cmd,
++        const std::vector<VkImageMemoryBarrier2>& barriers) {
++    if (barriers.empty())
++        return;
++
++    if (Core::isSynchronization2Enabled()) {
++        const VkDependencyInfo dependencyInfo = {
++            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++            .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
++            .pImageMemoryBarriers = barriers.data()
++        };
++        vkCmdPipelineBarrier2(cmd, &dependencyInfo);
++        return;
++    }
++
++    // Legacy path: one vkCmdPipelineBarrier with the union of the stage masks.
++    // Every barrier recorded together here shares the same stage pair, so the
++    // union is exact, not merely conservative.
++    std::vector<VkImageMemoryBarrier> legacy;
++    legacy.reserve(barriers.size());
++    VkPipelineStageFlags srcStages = 0;
++    VkPipelineStageFlags dstStages = 0;
++    for (const auto& b : barriers) {
++        srcStages |= static_cast<VkPipelineStageFlags>(b.srcStageMask);
++        dstStages |= static_cast<VkPipelineStageFlags>(b.dstStageMask);
++        legacy.push_back(VkImageMemoryBarrier{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .srcAccessMask = static_cast<VkAccessFlags>(b.srcAccessMask),
++            .dstAccessMask = static_cast<VkAccessFlags>(b.dstAccessMask),
++            .oldLayout = b.oldLayout,
++            .newLayout = b.newLayout,
++            .srcQueueFamilyIndex = b.srcQueueFamilyIndex,
++            .dstQueueFamilyIndex = b.dstQueueFamilyIndex,
++            .image = b.image,
++            .subresourceRange = b.subresourceRange
++        });
++    }
++    // Legacy barriers may not use an empty stage mask (sync2 allows 0 == NONE).
++    if (srcStages == 0) srcStages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++    if (dstStages == 0) dstStages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
++
++    vkCmdPipelineBarrier(cmd, srcStages, dstStages, 0,
++        0, nullptr, 0, nullptr,
++        static_cast<uint32_t>(legacy.size()), legacy.data());
++}
++
+ BarrierBuilder& BarrierBuilder::addR2W(Core::Image& image) {
+     this->barriers.emplace_back(VkImageMemoryBarrier2 {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+@@ -64,12 +120,7 @@
+ }
+ 
+ void BarrierBuilder::build() const {
+-    const VkDependencyInfo dependencyInfo = {
+-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+-        .imageMemoryBarrierCount = static_cast<uint32_t>(this->barriers.size()),
+-        .pImageMemoryBarriers = this->barriers.data()
+-    };
+-    vkCmdPipelineBarrier2(this->commandBuffer->handle(), &dependencyInfo);
++    Utils::cmdImageBarriers(this->commandBuffer->handle(), this->barriers);
+ }
+ 
+ void Utils::uploadImage(const Core::Device& device, const Core::CommandPool& commandPool,
+@@ -163,13 +214,8 @@
+             .layerCount = 1
+         }
+     };
+-    const VkDependencyInfo dependencyInfo = {
+-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+-        .imageMemoryBarrierCount = 1,
+-        .pImageMemoryBarriers = &barrier
+-    };
+     image.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-    vkCmdPipelineBarrier2(cmdBuf.handle(), &dependencyInfo);
++    Utils::cmdImageBarriers(cmdBuf.handle(), std::vector<VkImageMemoryBarrier2>{barrier});
+ 
+     const float clearValue = white ? 1.0F : 0.0F;
+     const VkClearColorValue clearColor = {{ clearValue, clearValue, clearValue, clearValue }};
+diff -ruN fg_orig/framegen/src/core/device.cpp fg/lsfg-vk-android-release/framegen/src/core/device.cpp
+--- a/framegen/src/core/device.cpp	2026-10-18 06:11:51.959058808 +0000
++++ b/framegen/src/core/device.cpp	2026-10-18 06:12:29.827731845 +0000
+@@ -6,6 +6,7 @@
+ #include "core/instance.hpp"
+ #include "common/exception.hpp"
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
+@@ -40,8 +41,14 @@
+     return false;
+ }
+ 
++std::atomic<bool> g_sync2Enabled{false};
++
+ } // namespace
+ 
++bool LSFG::Core::isSynchronization2Enabled() noexcept {
++    return g_sync2Enabled.load(std::memory_order_acquire);
++}
++
+ const Image& Device::getFallbackDescriptorImage() const {
+     return *this->fallbackDescriptorImage;
+ }
+@@ -60,6 +67,7 @@
+ 
+     // get device by uuid
+     std::optional<VkPhysicalDevice> physicalDevice;
++    uint32_t deviceApiVersion = VK_API_VERSION_1_0;
+     for (const auto& device : devices) {
+         VkPhysicalDeviceProperties properties;
+         vkGetPhysicalDeviceProperties(device, &properties);
+@@ -68,6 +76,7 @@
+             static_cast<uint64_t>(properties.vendorID) << 32 | properties.deviceID;
+         if (deviceUUID == uuid || deviceUUID == 0x1463ABAC) {
+             physicalDevice = device;
++            deviceApiVersion = properties.apiVersion;
+             break;
+         }
+     }
+@@ -110,28 +119,78 @@
+         enabledExtensions.push_back(extension);
+     }
+ 
+-    const bool hasRobustness2 =
+-        hasExtension(availableExtensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+-    if (hasRobustness2) {
+-        enabledExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+-    }
++    // ------------------------------------------------------------------
++    // Feature negotiation.
++    //
++    // Every optional feature is queried first and requested only when the
++    // physical device reports it. Requesting an unsupported feature makes
++    // vkCreateDevice fail with VK_ERROR_FEATURE_NOT_PRESENT (-8), which is
++    // what happened on Vulkan 1.1 GPUs such as Adreno 619.
++    //
++    // The per-feature structs (not VkPhysicalDeviceVulkan12/13Features) are
++    // used because they are valid on 1.1 devices when the matching extension
++    // is exposed, and remain valid on 1.2/1.3 where the features are core.
++    // ------------------------------------------------------------------
++    const bool api12 = deviceApiVersion >= VK_API_VERSION_1_2;
++    const bool api13 = deviceApiVersion >= VK_API_VERSION_1_3;
++
++    const bool extTimeline = hasExtension(availableExtensions, "VK_KHR_timeline_semaphore");
++    const bool extSync2    = hasExtension(availableExtensions, "VK_KHR_synchronization2");
++    const bool extMemModel = hasExtension(availableExtensions, "VK_KHR_vulkan_memory_model");
++    const bool extFloat16  = hasExtension(availableExtensions, "VK_KHR_shader_float16_int8");
++    const bool extRobust2  = hasExtension(availableExtensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
++
++    const bool canTimeline = api12 || extTimeline;
++    const bool canSync2    = api13 || extSync2;
++    const bool canMemModel = api12 || extMemModel;
++    const bool canFloat16  = api12 || extFloat16;
+ 
+-    // Probe FP16 support on this physical device. The LSFG-Android port can
+-    // load precompiled SPIR-V FP16 shader variants from Lossless.dll (resource
+-    // IDs 304..351) which carry `OpCapability Float16`. Vulkan rejects those at
+-    // vkCreateShaderModule time unless the device was created with the
+-    // shaderFloat16 feature explicitly enabled. We probe and unconditionally
+-    // enable it when supported — there's no downside on FP32-only sessions and
+-    // it lets the FP16 path "just work" when the user toggles it on.
+-    VkPhysicalDeviceShaderFloat16Int8Features fp16Probe{
++    VkPhysicalDeviceTimelineSemaphoreFeatures qTimeline{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
++    };
++    VkPhysicalDeviceSynchronization2Features qSync2{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
++    };
++    VkPhysicalDeviceVulkanMemoryModelFeatures qMemModel{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES,
++    };
++    VkPhysicalDeviceShaderFloat16Int8Features qFloat16{
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+     };
+-    VkPhysicalDeviceFeatures2 featsProbe{
+-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+-        .pNext = &fp16Probe,
++    VkPhysicalDeviceRobustness2FeaturesEXT qRobust2{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+     };
+-    vkGetPhysicalDeviceFeatures2(*physicalDevice, &featsProbe);
+-    const bool hasFloat16 = fp16Probe.shaderFloat16 == VK_TRUE;
++    {
++        void* head = nullptr;
++        auto link = [&head](auto& st, bool ok) {
++            if (!ok) return;
++            st.pNext = head;
++            head = &st;
++        };
++        link(qTimeline, canTimeline);
++        link(qSync2, canSync2);
++        link(qMemModel, canMemModel);
++        link(qFloat16, canFloat16);
++        link(qRobust2, extRobust2);
++        VkPhysicalDeviceFeatures2 featsQuery{
++            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
++            .pNext = head,
++        };
++        vkGetPhysicalDeviceFeatures2(*physicalDevice, &featsQuery);
++    }
++
++    const bool hasTimeline  = canTimeline && qTimeline.timelineSemaphore == VK_TRUE;
++    const bool hasSync2     = canSync2 && qSync2.synchronization2 == VK_TRUE;
++    const bool hasMemModel  = canMemModel && qMemModel.vulkanMemoryModel == VK_TRUE;
++    const bool hasFloat16   = canFloat16 && qFloat16.shaderFloat16 == VK_TRUE;
++    const bool hasRobustness2 = extRobust2 && qRobust2.nullDescriptor == VK_TRUE;
++
++    // Extensions are needed only on devices where the feature is not core.
++    if (!api12 && hasTimeline)  enabledExtensions.push_back("VK_KHR_timeline_semaphore");
++    if (!api13 && hasSync2)     enabledExtensions.push_back("VK_KHR_synchronization2");
++    if (!api12 && hasMemModel)  enabledExtensions.push_back("VK_KHR_vulkan_memory_model");
++    if (!api12 && hasFloat16)   enabledExtensions.push_back("VK_KHR_shader_float16_int8");
++    if (extRobust2 && hasRobustness2) enabledExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+ 
+     // create logical device
+     const float queuePriority{1.0F}; // highest priority
+@@ -139,22 +198,34 @@
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+         .nullDescriptor = VK_TRUE,
+     };
+-    VkPhysicalDeviceVulkan13Features features13{
+-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+-        .pNext = hasRobustness2 ? &robustness2 : nullptr,
+-        .synchronization2 = VK_TRUE
+-    };
+-    // shaderFloat16 is exposed in core Vulkan 1.2 — same struct we already
+-    // chain. Setting it conditionally avoids regressing devices that don't
+-    // advertise the feature (the validation layers reject create_device when
+-    // requested features are unsupported).
+-    VkPhysicalDeviceVulkan12Features features12{
+-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+-        .pNext = &features13,
+-        .shaderFloat16 = hasFloat16 ? VK_TRUE : VK_FALSE,
++    VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeat{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+         .timelineSemaphore = VK_TRUE,
+-        .vulkanMemoryModel = VK_TRUE
+     };
++    VkPhysicalDeviceSynchronization2Features sync2Feat{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
++        .synchronization2 = VK_TRUE,
++    };
++    VkPhysicalDeviceVulkanMemoryModelFeatures memModelFeat{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES,
++        .vulkanMemoryModel = VK_TRUE,
++    };
++    VkPhysicalDeviceShaderFloat16Int8Features float16Feat{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
++        .shaderFloat16 = VK_TRUE,
++    };
++    void* createChain = nullptr;
++    auto push = [&createChain](auto& st, bool use) {
++        if (!use) return;
++        st.pNext = createChain;
++        createChain = &st;
++    };
++    push(timelineFeat, hasTimeline);
++    push(sync2Feat, hasSync2);
++    push(memModelFeat, hasMemModel);
++    push(float16Feat, hasFloat16);
++    push(robustness2, hasRobustness2);
++
+     const VkDeviceQueueCreateInfo computeQueueDesc{
+         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueFamilyIndex = *computeFamilyIdx,
+@@ -163,7 +234,7 @@
+     };
+     const VkDeviceCreateInfo deviceCreateInfo{
+         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+-        .pNext = &features12,
++        .pNext = createChain,
+         .queueCreateInfoCount = 1,
+         .pQueueCreateInfos = &computeQueueDesc,
+         .enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size()),
+@@ -172,7 +243,14 @@
+     VkDevice deviceHandle{};
+     res = vkCreateDevice(*physicalDevice, &deviceCreateInfo, nullptr, &deviceHandle);
+     if (res != VK_SUCCESS || deviceHandle == VK_NULL_HANDLE)
+-        throw LSFG::vulkan_error(res, "Failed to create logical device");
++        throw LSFG::vulkan_error(res, std::string("Failed to create logical device (api=")
++            + std::to_string(VK_VERSION_MAJOR(deviceApiVersion)) + "."
++            + std::to_string(VK_VERSION_MINOR(deviceApiVersion))
++            + " timeline=" + std::to_string(hasTimeline)
++            + " sync2=" + std::to_string(hasSync2)
++            + " memModel=" + std::to_string(hasMemModel)
++            + " float16=" + std::to_string(hasFloat16)
++            + " nullDescriptor=" + std::to_string(hasRobustness2) + ")");
+ 
+     volkLoadDevice(deviceHandle);
+ 
+@@ -185,6 +263,9 @@
+     this->computeFamilyIdx = *computeFamilyIdx;
+     this->physicalDevice = *physicalDevice;
+     this->nullDescriptorSupported = hasRobustness2;
++    this->timelineSupported = hasTimeline;
++    this->sync2Supported = hasSync2;
++    g_sync2Enabled.store(hasSync2, std::memory_order_release);
+     this->device = std::shared_ptr<VkDevice>(
+         new VkDevice(deviceHandle),
+         [](VkDevice* device) {
+diff -ruN fg_orig/framegen/src/core/semaphore.cpp fg/lsfg-vk-android-release/framegen/src/core/semaphore.cpp
+--- a/framegen/src/core/semaphore.cpp	2026-10-18 06:11:51.959198111 +0000
++++ b/framegen/src/core/semaphore.cpp	2026-10-18 06:12:29.828203564 +0000
+@@ -13,6 +13,12 @@
+ using namespace LSFG::Core;
+ 
+ Semaphore::Semaphore(const Core::Device& device, std::optional<uint32_t> initial) {
++    // Timeline semaphores need the timelineSemaphore feature, which Vulkan 1.1
++    // GPUs (e.g. Adreno 619) lack. Binary semaphores (initial == nullopt) do not.
++    if (initial.has_value() && !device.supportsTimelineSemaphore())
++        throw LSFG::vulkan_error(VK_ERROR_FEATURE_NOT_PRESENT,
++            "Timeline semaphore requested but timelineSemaphore is not supported by this device");
++
+     // create semaphore
+     const VkSemaphoreTypeCreateInfo typeInfo{
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+diff -ruN fg_orig/framegen/v3.1_src/context.cpp fg/lsfg-vk-android-release/framegen/v3.1_src/context.cpp
+--- a/framegen/v3.1_src/context.cpp	2026-10-18 06:11:51.959512386 +0000
++++ b/framegen/v3.1_src/context.cpp	2026-10-18 06:12:29.829556694 +0000
+@@ -69,12 +69,7 @@
+     if (barriers.empty())
+         return;
+ 
+-    const VkDependencyInfo dependencyInfo{
+-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+-        .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+-        .pImageMemoryBarriers = barriers.data(),
+-    };
+-    vkCmdPipelineBarrier2(buf.handle(), &dependencyInfo);
++    Utils::cmdImageBarriers(buf.handle(), barriers);
+ }
+ 
+ } // namespace
+diff -ruN fg_orig/framegen/v3.1p_src/context.cpp fg/lsfg-vk-android-release/framegen/v3.1p_src/context.cpp
+--- a/framegen/v3.1p_src/context.cpp	2026-10-18 06:11:51.960071699 +0000
++++ b/framegen/v3.1p_src/context.cpp	2026-10-18 06:12:29.830010098 +0000
+@@ -70,12 +70,7 @@
+     if (barriers.empty())
+         return;
+ 
+-    const VkDependencyInfo dependencyInfo{
+-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+-        .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+-        .pImageMemoryBarriers = barriers.data(),
+-    };
+-    vkCmdPipelineBarrier2(buf.handle(), &dependencyInfo);
++    Utils::cmdImageBarriers(buf.handle(), barriers);
+ }
+ 
+ } // namespace
