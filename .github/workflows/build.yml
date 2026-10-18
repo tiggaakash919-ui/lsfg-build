@@ -20,12 +20,17 @@ jobs:
           mkdir work && cd work
           git clone https://github.com/FrankBarretta/LSFG-Android-Application.git
           git -C LSFG-Android-Application checkout b84754199823615d32d65fe33ea59481dca88dcf
-          git clone --recursive -b release https://github.com/FrankBarretta/lsfg-vk-android.git
-          git -C lsfg-vk-android log -1 --format='framegen commit: %H'
+          git clone https://github.com/FrankBarretta/lsfg-vk-android.git
+          git -C lsfg-vk-android checkout 3e89e5439a98f55d5acb003d20039426ab24e69c
+          git -C lsfg-vk-android submodule update --init --recursive
 
-      - name: Apply patch
+      - name: Apply app patch
         working-directory: work/LSFG-Android-Application
         run: patch -p1 < ../../patch-repo/adreno619-session-fix.patch
+
+      - name: Apply framegen patch
+        working-directory: work/lsfg-vk-android
+        run: patch -p1 < ../../patch-repo/framegen-adreno619.patch
 
       - name: Install NDK and CMake
         run: |
