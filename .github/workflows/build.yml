@@ -1,0 +1,44 @@
+name: Build LSFG arm64 APK
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patch-repo
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Fetch sources
+        run: |
+          mkdir work && cd work
+          git clone https://github.com/FrankBarretta/LSFG-Android-Application.git
+          git -C LSFG-Android-Application checkout b84754199823615d32d65fe33ea59481dca88dcf
+          git clone --recursive -b release https://github.com/FrankBarretta/lsfg-vk-android.git
+          git -C lsfg-vk-android log -1 --format='framegen commit: %H'
+
+      - name: Apply patch
+        working-directory: work/LSFG-Android-Application
+        run: patch -p1 < ../../patch-repo/adreno619-session-fix.patch
+
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.0.12077973" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Build debug APK
+        working-directory: work/LSFG-Android-Application
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsfg-apk
+          path: work/LSFG-Android-Application/app/build/outputs/apk/debug/*.apk
